@@ -110,6 +110,7 @@ async def send_whatsapp_message(recipient_number: str, message_text: str):
 # ==========================================
 
 @app.get("/api/webhook")
+@app.get("/webhook")
 async def verify_webhook(
     hub_mode: str = Query(None, alias="hub.mode"),
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
@@ -122,12 +123,13 @@ async def verify_webhook(
     logger.info(f"Webhook verification check received: mode={hub_mode}, token={hub_verify_token}")
     if hub_mode == "subscribe" and hub_verify_token == WHATSAPP_VERIFY_TOKEN:
         logger.info("Webhook verification succeeded.")
-        return PlainTextResponse(content=hub_challenge, status_code=200)
+        return PlainTextResponse(content=hub_challenge or "", status_code=200)
     
     logger.warning("Webhook verification failed: Invalid verify token.")
     return PlainTextResponse(content="Forbidden: Verification token mismatch", status_code=403)
 
 @app.post("/api/webhook")
+@app.post("/webhook")
 async def handle_whatsapp_message(request: Request):
     """
     Handles incoming messages from WhatsApp Meta Cloud API.
