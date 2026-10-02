@@ -1,6 +1,44 @@
-# 🚀 WhatsApp Groq AI Bot
+# 🚀 WhatsApp Groq AI Bot & Live Messages Dashboard
 
-A lightweight, serverless WhatsApp AI bot powered by **Groq** using **`openai/gpt-oss-120b`**, configured for instant deployment to **Vercel** and direct integration with **Meta WhatsApp Cloud API** (and Twilio Sandbox).
+A serverless & local WhatsApp AI bot and live messages dashboard powered by **Groq** using **`openai/gpt-oss-120b`**, integrated with **Meta WhatsApp Cloud API** (and Twilio Sandbox).
+
+---
+
+## ✨ Features
+
+- 📊 **Real-time WhatsApp Dashboard**: WhatsApp Web-style CRM to inspect all incoming customer messages and outgoing AI/admin replies.
+- ⚡ **Groq Ultra-Fast AI**: Powered by `openai/gpt-oss-120b` (with auto-fallback to `llama-3.3-70b-versatile`).
+- 🤖 **Multi-Channel Message Tracking**: Captures Meta WhatsApp Cloud API, Twilio, and Simulator messages with full latency and model tracking.
+- 💬 **Live Auto-Refresh & Inbox**: Multi-contact threads, unread counts, search filters, and message status ticks.
+- ✍️ **Admin Reply / AI Trigger**: Send manual replies or auto-generate AI answers directly from the dashboard.
+- 🔬 **Incoming Message Simulator**: Test incoming customer WhatsApp messages without setting up Meta developer credentials first.
+- 🔍 **Webhook Inspector**: Real-time event log for verification requests and Meta Graph API JSON payloads.
+
+---
+
+## 🚀 Running Locally
+
+1. **Install dependencies:**
+   ```bash
+   py -m pip install -r requirements.txt
+   ```
+
+2. **Configure your environment (optional for Groq AI & Meta API):**
+   Copy `.env.example` to `.env`:
+   ```bash
+   cp .env.example .env
+   ```
+   Add your `GROQ_API_KEY`, `WHATSAPP_TOKEN`, and `WHATSAPP_PHONE_NUMBER_ID`.
+
+3. **Start the Dashboard:**
+   ```bash
+   py run_dashboard.py
+   ```
+   Or with uvicorn:
+   ```bash
+   py -m uvicorn api.index:app --reload --port 8000
+   ```
+   Open **`http://localhost:8000`** (or `http://localhost:8000/dashboard`) in your browser.
 
 ---
 
@@ -8,7 +46,7 @@ A lightweight, serverless WhatsApp AI bot powered by **Groq** using **`openai/gp
 
 When Meta asks for your Webhook credentials in the Meta Developer Console:
 
-* **Callback URL:** `https://<your-vercel-domain>.vercel.app/api/webhook`
+* **Callback URL:** `https://<your-domain>/api/webhook`
 * **Verify Token:** `whatsapp_groq_bot_secret_123`
 * **Webhook Fields to Subscribe:** `messages`
 
@@ -16,9 +54,7 @@ When Meta asks for your Webhook credentials in the Meta Developer Console:
 
 ---
 
-## 🔑 Environment Variables Required
-
-In your **Vercel Project Settings > Environment Variables** (or local `.env`):
+## 🔑 Environment Variables
 
 | Variable | Description | Where to get it |
 | :--- | :--- | :--- |
@@ -35,39 +71,13 @@ In your **Vercel Project Settings > Environment Variables** (or local `.env`):
 ```
 .
 ├── api/
-│   └── index.py            # FastAPI serverless app (WhatsApp Webhooks & Groq AI)
+│   ├── index.py            # FastAPI app & WhatsApp Dashboard + Webhooks
+│   ├── webhook.py          # Dedicated Meta webhook endpoint
+│   └── db.py               # SQLite message storage, stats, & webhook logger
+├── run_dashboard.py        # Local one-click dashboard runner
 ├── .env.example            # Template for environment variables
 ├── .gitignore              # Protects secrets from being committed
-├── requirements.txt        # Python dependencies (fastapi, groq, httpx)
-├── vercel.json             # Vercel serverless routing
+├── requirements.txt        # Python dependencies (fastapi, groq, httpx, uvicorn)
 ├── test_bot.py             # Local CLI test script
 └── README.md               # Documentation
 ```
-
----
-
-## 🚀 How to Deploy on Vercel
-
-1. Go to [Vercel](https://vercel.com) and click **"Add New Project"**.
-2. Select your repository: **`printingtaskweb-dot/whatapp`**.
-3. Under **Environment Variables**, add:
-   * `GROQ_API_KEY`
-   * `GROQ_MODEL` (`openai/gpt-oss-120b`)
-   * `WHATSAPP_TOKEN`
-   * `WHATSAPP_PHONE_NUMBER_ID`
-   * `WHATSAPP_VERIFY_TOKEN` (`whatsapp_groq_bot_secret_123`)
-4. Click **Deploy**.
-5. Once deployed, Vercel gives you your live URL (e.g., `https://whatapp-xxxx.vercel.app`).
-6. Copy that URL and enter it in Meta:
-   * **Callback URL:** `https://whatapp-xxxx.vercel.app/api/webhook`
-   * **Verify Token:** `whatsapp_groq_bot_secret_123`
-7. Click **Verify and Save**, then under **Webhook fields**, click **Manage** and subscribe to **`messages`**.
-
----
-
-## 📱 Testing Without WhatsApp First (Browser Simulator)
-
-Once deployed to Vercel, navigate directly to your root URL:
-`https://<your-vercel-domain>.vercel.app`
-
-This opens an interactive WhatsApp web simulator where you can test chatting with Groq's `openai/gpt-oss-120b` model right in your browser!

@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 import httpx
 from fastapi import FastAPI, Request, Response, Query
@@ -7,7 +8,15 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 from groq import Groq
 from dotenv import load_dotenv
 
+try:
+    from api import db
+except ImportError:
+    import db
+
 load_dotenv()
+
+# Initialize database
+db.init_db()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("whatsapp_webhook")
@@ -20,10 +29,11 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "whatsapp_groq_bot_secret_123")
 
-def ask_groq(user_prompt: str) -> str:
-    """Generate AI response using Groq."""
+def ask_groq(user_prompt: str) -> tuple[str, float]:
+    """Generate AI response using Groq with latency calculation."""
+    start_time = time.time()
     if not GROQ_API_KEY:
-        return "GROQ_API_KEY is not set."
+        return "GROQ_API_KEY is not set.", 0.0
     
     client = Groq(api_key=GROQ_API_KEY)
     try:
@@ -43,7 +53,8 @@ def ask_groq(user_prompt: str) -> str:
             max_completion_tokens=2048,
             reasoning_effort="medium"
         )
-        return completion.choices[0].message.content or "No response generated."
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+        return completion.choices[0].message.content or "No response generated.", latency_ms
     except Exception as e:
         logger.error(f"Error calling Groq {GROQ_MODEL}: {e}")
         try:
@@ -52,15 +63,17 @@ def ask_groq(user_prompt: str) -> str:
                 messages=[{"role": "user", "content": user_prompt}],
                 max_tokens=1024
             )
-            return fallback.choices[0].message.content or ""
+            latency_ms = round((time.time() - start_time) * 1000, 2)
+            return fallback.choices[0].message.content or "", latency_ms
         except Exception as e2:
-            return f"Error: {e2}"
+            latency_ms = round((time.time() - start_time) * 1000, 2)
+            return f"Error: {e2}", latency_ms
 
 async def send_whatsapp_reply(to_number: str, text: str):
     """Send text reply back to WhatsApp user."""
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         logger.warning("WhatsApp credentials missing.")
-        return False
+        return False, "Credentials missing"
     
     url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
@@ -75,9 +88,12 @@ async def send_whatsapp_reply(to_number: str, text: str):
         "text": {"preview_url": False, "body": text}
     }
     async with httpx.AsyncClient(timeout=10.0) as http:
-        res = await http.post(url, headers=headers, json=payload)
-        logger.info(f"Meta Send API response ({res.status_code}): {res.text}")
-        return res.status_code == 200
+        try:
+            res = await http.post(url, headers=headers, json=payload)
+            logger.info(f"Meta Send API response ({res.status_code}): {res.text}")
+            return res.status_code == 200, res.text
+        except Exception as e:
+            return False, str(e)
 
 # Handle verification on ANY path: /, /webhook, /api/webhook
 @app.get("/")
@@ -93,11 +109,17 @@ async def verify(
     
     logger.info(f"Verify check: received='{clean_received}', expected='{clean_expected}'")
     
-    # Accept either the env variable, trimmed env variable, or default fallback
     is_valid = (
         clean_received == clean_expected
         or clean_received == "whatsapp_groq_bot_secret_123"
         or clean_received == "whatsapp_groq_bot_secret_123".strip()
+    )
+
+    db.save_webhook_log(
+        endpoint="/api/webhook",
+        method="GET",
+        payload={"hub.mode": hub_mode, "hub.verify_token": hub_verify_token, "hub.challenge": hub_challenge},
+        status_code=200 if (hub_mode == "subscribe" and is_valid) else 403
     )
 
     if hub_mode == "subscribe" and is_valid:
@@ -115,18 +137,48 @@ async def receive_message(request: Request):
     try:
         data = await request.json()
         logger.info(f"Received webhook: {json.dumps(data)}")
+        db.save_webhook_log(endpoint="/api/webhook", method="POST", payload=data, status_code=200)
+
         entries = data.get("entry", [])
         for entry in entries:
             for change in entry.get("changes", []):
                 value = change.get("value", {})
+                contacts = value.get("contacts", [])
+                sender_name = contacts[0].get("profile", {}).get("name", "User") if contacts else "User"
+                
                 for msg in value.get("messages", []):
                     if msg.get("type") == "text":
                         sender = msg.get("from")
                         user_text = msg.get("text", {}).get("body", "").strip()
+                        
+                        # Save inbound message
+                        db.save_message(
+                            phone_number=sender,
+                            sender_name=sender_name,
+                            message=user_text,
+                            direction="inbound",
+                            channel="meta_whatsapp",
+                            raw_payload=msg
+                        )
+
                         if user_text:
-                            reply = ask_groq(user_text)
-                            await send_whatsapp_reply(sender, reply)
+                            reply, latency_ms = ask_groq(user_text)
+                            success, send_res = await send_whatsapp_reply(sender, reply)
+                            
+                            # Save outbound message
+                            db.save_message(
+                                phone_number=sender,
+                                sender_name="Groq AI Bot",
+                                message=reply,
+                                direction="outbound",
+                                channel="meta_whatsapp",
+                                status="sent" if success else "failed",
+                                ai_model=GROQ_MODEL,
+                                latency_ms=latency_ms
+                            )
+
     except Exception as e:
         logger.error(f"Error handling message: {e}")
+        db.save_webhook_log(endpoint="/api/webhook", method="POST", payload=str(e), status_code=400)
     
     return JSONResponse({"status": "ok"}, status_code=200)
