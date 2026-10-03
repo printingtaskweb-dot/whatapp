@@ -166,7 +166,7 @@ async def handle_twilio_webhook(From: str = Form(None), Body: str = Form(None), 
         groq_model = get_env_var("GROQ_MODEL", "llama-3.3-70b-versatile")
         reply, latency_ms, engine_used = generate_ai_reply(user_text, groq_key, groq_model)
 
-    db.save_message(phone_number=sender_id, sender_name="Support Agent", message=reply, direction="outbound", channel="twilio", status="sent", ai_model=engine_used, latency_ms=latency_ms)
+    db.save_message(phone_number=sender_id, sender_name="Support Agent (AI)", message=reply, direction="outbound", channel="twilio", status="sent", ai_model=engine_used, latency_ms=latency_ms)
 
     escaped = reply.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
     return Response(content=f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{escaped}</Message></Response>', media_type="application/xml")
@@ -218,7 +218,6 @@ async def delete_template(id: int = Query(...)):
 
 @app.post("/api/dashboard/contact/bot-toggle")
 async def toggle_contact_bot(request: Request):
-    """Enable or disable AI bot auto-reply for a specific customer."""
     data = await request.json()
     phone = data.get("phone", "")
     enabled = bool(data.get("enabled", True))
@@ -249,13 +248,60 @@ async def add_booking(request: Request):
     )
     return JSONResponse({"success": bool(b_id), "id": b_id})
 
-@app.post("/api/dashboard/send")
-async def send_dashboard_reply(request: Request):
-    """Send custom message, template, or AI response directly to customer."""
+@app.post("/api/dashboard/trigger-ai-reply")
+async def trigger_ai_reply(request: Request):
+    """Force generate an AI bot reply to a specific customer's latest message."""
     data = await request.json()
     phone = (data.get("phone") or "").strip()
+    prompt = (data.get("prompt") or "").strip()
+    
+    if not prompt and phone:
+        msgs = db.get_messages(phone_number=phone, limit=5)
+        inbounds = [m for m in msgs if m["direction"] == "inbound"]
+        if inbounds:
+            prompt = inbounds[-1]["message"]
+    
+    if not prompt:
+        prompt = "Hello! How can customer support help me today?"
+
+    groq_key = get_env_var("GROQ_API_KEY")
+    groq_model = get_env_var("GROQ_MODEL", "llama-3.3-70b-versatile")
+    reply, latency_ms, engine_used = generate_ai_reply(prompt, groq_key, groq_model)
+
+    msg_id = None
+    if phone:
+        msg_id = db.save_message(
+            phone_number=phone,
+            sender_name="Support Agent (AI)",
+            message=reply,
+            direction="outbound",
+            channel="meta_whatsapp",
+            status="sent",
+            ai_model=engine_used,
+            latency_ms=latency_ms
+        )
+
+    return JSONResponse({
+        "success": True,
+        "message_id": msg_id,
+        "reply": reply,
+        "engine": engine_used,
+        "latency_ms": latency_ms
+    })
+
+@app.post("/api/dashboard/send")
+async def send_dashboard_reply(request: Request):
+    """
+    Send message from dashboard.
+    If role is 'customer': simulates customer asking question + triggers AI auto reply!
+    If role is 'agent': sends manual response from agent.
+    If role is 'ai': generates AI response as agent.
+    """
+    data = await request.json()
+    phone = (data.get("phone") or "+14155550199").strip()
+    customer_name = (data.get("name") or "Customer").strip()
     msg_input = (data.get("message") or "").strip()
-    mode = data.get("type", "manual") # "manual", "template", or "ai"
+    role = data.get("role", "customer") # "customer" (default for testing AI reply), "agent", "ai"
     send_via_meta = data.get("send_via_meta", False)
     
     if not phone or not msg_input:
@@ -263,8 +309,49 @@ async def send_dashboard_reply(request: Request):
 
     groq_key = get_env_var("GROQ_API_KEY")
     groq_model = get_env_var("GROQ_MODEL", "llama-3.3-70b-versatile")
-    
-    if mode == "ai":
+
+    # Case 1: Message is typed as Customer -> save inbound and trigger AI reply!
+    if role == "customer":
+        inbound_id = db.save_message(
+            phone_number=phone,
+            sender_name=customer_name,
+            message=msg_input,
+            direction="inbound",
+            channel="simulator",
+            status="received"
+        )
+
+        bot_active = db.is_bot_enabled_for_contact(phone)
+        ai_reply = ""
+        latency_ms = 0.0
+        engine_used = ""
+        outbound_id = None
+
+        if bot_active:
+            ai_reply, latency_ms, engine_used = generate_ai_reply(msg_input, groq_key, groq_model)
+            outbound_id = db.save_message(
+                phone_number=phone,
+                sender_name="Support Agent (AI)",
+                message=ai_reply,
+                direction="outbound",
+                channel="simulator",
+                status="sent",
+                ai_model=engine_used,
+                latency_ms=latency_ms
+            )
+
+        return JSONResponse({
+            "success": True,
+            "inbound_id": inbound_id,
+            "outbound_id": outbound_id,
+            "customer_message": msg_input,
+            "ai_reply": ai_reply,
+            "engine": engine_used,
+            "latency_ms": latency_ms
+        })
+
+    # Case 2: Message is typed as Agent or AI generator
+    if role == "ai":
         reply_body, latency_ms, engine_used = generate_ai_reply(msg_input, groq_key, groq_model)
         sender_name = "Support Agent (AI)"
     else:
@@ -285,7 +372,7 @@ async def send_dashboard_reply(request: Request):
         sender_name=sender_name,
         message=reply_body,
         direction="outbound",
-        channel="manual_admin" if mode != "ai" else "meta_whatsapp",
+        channel="manual_admin" if role != "ai" else "meta_whatsapp",
         status=status,
         raw_payload=meta_payload,
         ai_model=engine_used,
@@ -304,7 +391,6 @@ async def send_dashboard_reply(request: Request):
 
 @app.post("/api/dashboard/simulate-inbound")
 async def simulate_inbound(request: Request):
-    """Simulate customer inbound message and trigger support bot reply."""
     data = await request.json()
     phone = (data.get("phone") or "+14155550199").strip()
     name = (data.get("name") or "Sarah Jenkins").strip()
@@ -352,6 +438,22 @@ async def simulate_inbound(request: Request):
         "ai_reply": ai_reply,
         "engine": engine_used,
         "latency_ms": latency_ms
+    })
+
+@app.post("/api/dashboard/test-ai")
+async def test_ai_endpoint(request: Request):
+    """Test AI bot reply to any text prompt directly."""
+    data = await request.json()
+    prompt = data.get("prompt", "Hello, what are your printing services and prices?")
+    groq_key = get_env_var("GROQ_API_KEY")
+    groq_model = get_env_var("GROQ_MODEL", "llama-3.3-70b-versatile")
+    reply, latency_ms, engine_used = generate_ai_reply(prompt, groq_key, groq_model)
+    return JSONResponse({
+        "prompt": prompt,
+        "reply": reply,
+        "engine": engine_used,
+        "latency_ms": latency_ms,
+        "groq_configured": bool(groq_key and not groq_key.startswith("gsk_your"))
     })
 
 @app.get("/api/dashboard/settings")
@@ -450,26 +552,6 @@ async def serve_dashboard():
     <title>Customer Support Desk • WhatsApp Business CRM</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        brand: {
-                            50: '#f0fdf4',
-                            100: '#dcfce7',
-                            500: '#22c55e',
-                            600: '#16a34a',
-                            700: '#15803d',
-                            wa: '#25D366',
-                            waDark: '#128C7E',
-                            waLightBg: '#efeae2'
-                        }
-                    }
-                }
-            }
-        }
-    </script>
     <!-- FontAwesome 6 -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <!-- Google Fonts -->
@@ -483,7 +565,6 @@ async def serve_dashboard():
             background-image: radial-gradient(#d1c7b7 1.2px, transparent 1.2px);
             background-size: 20px 20px;
         }
-        /* Custom scrollbar for clean white theme */
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #f1f5f9; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
@@ -505,10 +586,10 @@ async def serve_dashboard():
                 <div class="flex items-center space-x-2.5">
                     <h1 class="font-extrabold text-lg text-slate-900 tracking-tight">Customer Support Agent Desk</h1>
                     <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                        <span class="w-2 h-2 rounded-full bg-emerald-500 mr-1.5 live-dot"></span> Online & Active
+                        <span class="w-2 h-2 rounded-full bg-emerald-500 mr-1.5 live-dot"></span> AI Bot Active
                     </span>
                 </div>
-                <p class="text-xs text-slate-500">Live WhatsApp Chat CRM • AI Support Agent • Custom Templates & Bookings</p>
+                <p class="text-xs text-slate-500">Live WhatsApp Chat CRM • Auto AI Support Bot • Templates & Appointments</p>
             </div>
         </div>
 
@@ -520,11 +601,15 @@ async def serve_dashboard():
             </button>
             <button onclick="switchTab('templates')" id="tab-btn-templates" class="px-3.5 py-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-white/60 transition flex items-center space-x-1.5">
                 <i class="fas fa-layer-group text-blue-500"></i>
-                <span>Message Templates</span>
+                <span>Templates</span>
             </button>
             <button onclick="switchTab('bookings')" id="tab-btn-bookings" class="px-3.5 py-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-white/60 transition flex items-center space-x-1.5">
                 <i class="fas fa-calendar-check text-amber-500"></i>
                 <span>Bookings (<span id="nav-bookings-count">0</span>)</span>
+            </button>
+            <button onclick="switchTab('testai')" id="tab-btn-testai" class="px-3.5 py-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-white/60 transition flex items-center space-x-1.5">
+                <i class="fas fa-wand-magic-sparkles text-emerald-600"></i>
+                <span>Test AI Live</span>
             </button>
             <button onclick="switchTab('webhooks')" id="tab-btn-webhooks" class="px-3.5 py-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-white/60 transition flex items-center space-x-1.5">
                 <i class="fas fa-network-wired text-purple-500"></i>
@@ -540,7 +625,7 @@ async def serve_dashboard():
         <div class="flex items-center space-x-2.5">
             <button onclick="openSimulateModal()" class="flex items-center space-x-2 px-4 py-2 text-xs font-bold rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm transition">
                 <i class="fas fa-plus"></i>
-                <span>Simulate Customer Message</span>
+                <span>New Customer Simulator</span>
             </button>
             <button onclick="fetchData(true)" title="Refresh" class="w-9 h-9 flex items-center justify-center rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 transition">
                 <i class="fas fa-rotate-right text-xs" id="refresh-icon"></i>
@@ -551,7 +636,7 @@ async def serve_dashboard():
     <!-- Main Container -->
     <main class="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 flex flex-col space-y-4">
 
-        <!-- 4 Top Analytics Summary Cards (White Cards) -->
+        <!-- 4 Top Analytics Summary Cards -->
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <!-- Card 1: Total Messages -->
             <div class="bg-white border border-slate-200 rounded-2xl p-4 flex items-center justify-between shadow-sm">
@@ -595,9 +680,9 @@ async def serve_dashboard():
             <!-- Card 4: Support Agent Mode -->
             <div class="bg-white border border-slate-200 rounded-2xl p-4 flex items-center justify-between shadow-sm cursor-pointer hover:border-purple-400 transition" onclick="openSettingsModal()">
                 <div>
-                    <span class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Agent Engine</span>
-                    <h3 id="stat-latency" class="text-xl font-extrabold text-purple-700 mt-1">0 ms</h3>
-                    <p id="stat-engine-badge" class="text-[11px] text-slate-500 truncate max-w-[150px] font-mono mt-0.5 font-medium">Customer Support AI</p>
+                    <span class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">AI Bot Status</span>
+                    <h3 id="stat-engine-badge" class="text-base font-extrabold text-purple-700 mt-1 truncate max-w-[150px]">Customer Support AI</h3>
+                    <p id="stat-key-status" class="text-[11px] text-emerald-600 mt-0.5 font-bold"><i class="fas fa-check-circle mr-1"></i>Ready to Reply</p>
                 </div>
                 <div class="w-12 h-12 rounded-2xl bg-purple-50 text-purple-600 flex items-center justify-center text-xl font-bold">
                     <i class="fas fa-headset"></i>
@@ -656,11 +741,15 @@ async def serve_dashboard():
 
                     <!-- Header Controls & Bot Auto-Reply Toggle -->
                     <div class="flex items-center space-x-3">
-                        <!-- Per-contact Bot Auto-Reply Toggle -->
+                        <button onclick="triggerAiReplyForCurrent()" title="Force AI to reply to latest message" class="px-3 py-1.5 text-xs text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-xl transition font-bold flex items-center space-x-1">
+                            <i class="fas fa-wand-magic-sparkles text-emerald-600"></i>
+                            <span>AI Reply Now</span>
+                        </button>
+
                         <div id="bot-toggle-container" class="hidden flex items-center bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-semibold space-x-2">
                             <span class="text-slate-600 flex items-center space-x-1">
                                 <i class="fas fa-robot text-emerald-600"></i>
-                                <span>AI Bot:</span>
+                                <span>Auto Bot:</span>
                             </span>
                             <label class="relative inline-flex items-center cursor-pointer">
                                 <input type="checkbox" id="contact-bot-checkbox" onchange="toggleContactBot(this.checked)" class="sr-only peer" checked>
@@ -684,7 +773,7 @@ async def serve_dashboard():
                             <i class="fab fa-whatsapp"></i>
                         </div>
                         <h3 class="text-base font-bold text-slate-700">Customer Support Inbox</h3>
-                        <p class="text-xs text-slate-500 max-w-sm mt-1">Select a customer from the left or click <strong>Simulate Customer Message</strong> to test the conversation live.</p>
+                        <p class="text-xs text-slate-500 max-w-sm mt-1">Select a customer or type below to test chatting with the AI Support Bot.</p>
                     </div>
                 </div>
 
@@ -701,22 +790,27 @@ async def serve_dashboard():
                     </button>
                 </div>
 
-                <!-- Admin & AI Reply Input Box -->
+                <!-- Admin & Customer Multi-Role Reply Box -->
                 <div class="bg-white p-3.5 border-t border-slate-200 flex flex-col space-y-2.5">
                     <div class="flex items-center justify-between text-xs text-slate-500 px-1">
                         <div class="flex items-center space-x-4">
+                            <!-- 1. Send as Customer (Default: AI will automatically reply!) -->
                             <label class="flex items-center space-x-1.5 cursor-pointer">
-                                <input type="radio" name="reply_mode" id="mode-manual" value="manual" checked class="text-emerald-600 focus:ring-0">
-                                <span class="text-slate-800 font-bold">Reply as Support Agent</span>
+                                <input type="radio" name="reply_role" id="role-customer" value="customer" checked class="text-emerald-600 focus:ring-0">
+                                <span class="text-emerald-700 font-extrabold flex items-center space-x-1">
+                                    <i class="fas fa-user-tag text-emerald-600"></i>
+                                    <span>Chat as Customer (AI will reply!)</span>
+                                </span>
                             </label>
+                            <!-- 2. Send as Agent -->
                             <label class="flex items-center space-x-1.5 cursor-pointer">
-                                <input type="radio" name="reply_mode" id="mode-ai" value="ai" class="text-emerald-600 focus:ring-0">
-                                <span class="text-emerald-600 font-bold"><i class="fas fa-wand-magic-sparkles mr-1"></i>Generate AI Bot Reply</span>
+                                <input type="radio" name="reply_role" id="role-agent" value="agent" class="text-emerald-600 focus:ring-0">
+                                <span class="text-slate-700 font-bold">Reply as Support Agent</span>
                             </label>
                         </div>
                         <label class="flex items-center space-x-1.5 cursor-pointer text-slate-600 hover:text-slate-900 font-medium">
                             <input type="checkbox" id="send-meta-cloud" class="rounded text-emerald-600 focus:ring-0">
-                            <span>Send to Real WhatsApp (Meta API)</span>
+                            <span>Forward to Meta Cloud API</span>
                         </label>
                     </div>
 
@@ -724,7 +818,7 @@ async def serve_dashboard():
                         <input 
                             type="text" 
                             id="reply-input" 
-                            placeholder="Type a custom message or pick a template above..." 
+                            placeholder="Type a message (e.g. 'What are your printing prices?' or 'I want to book an appointment')..." 
                             class="flex-1 bg-slate-50 text-sm text-slate-900 placeholder-slate-400 px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 focus:bg-white transition"
                             autocomplete="off"
                         />
@@ -733,7 +827,7 @@ async def serve_dashboard():
                             id="send-reply-btn" 
                             class="px-5 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl flex items-center space-x-2 transition shadow-sm flex-shrink-0 disabled:opacity-50"
                         >
-                            <span>Send</span>
+                            <span>Send & Reply</span>
                             <i class="fas fa-paper-plane text-xs"></i>
                         </button>
                     </form>
@@ -743,7 +837,58 @@ async def serve_dashboard():
 
         </div>
 
-        <!-- ================= TAB 2: MESSAGE TEMPLATES VIEW ================= -->
+        <!-- ================= TAB 2: TEST AI LIVE SANDBOX ================= -->
+        <div id="view-testai" class="hidden bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col space-y-4 min-h-[600px]">
+            <div class="flex items-center justify-between pb-4 border-b border-slate-200">
+                <div>
+                    <h2 class="text-base font-extrabold text-slate-900 flex items-center space-x-2">
+                        <i class="fas fa-wand-magic-sparkles text-emerald-600"></i>
+                        <span>Live AI Response Sandbox</span>
+                    </h2>
+                    <p class="text-xs text-slate-500 mt-0.5">Test how the Customer Support Bot replies to any customer prompt in real-time</p>
+                </div>
+            </div>
+
+            <!-- Quick Test Prompt Buttons -->
+            <div class="space-y-2">
+                <span class="text-xs font-bold text-slate-600 uppercase tracking-wider">Try Sample Inquiries:</span>
+                <div class="flex flex-wrap gap-2">
+                    <button onclick="runAiSandboxTest('Hi! What services do you offer?')" class="px-3 py-1.5 bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 rounded-xl text-xs font-semibold border border-slate-200 transition">👋 Greeting & Services</button>
+                    <button onclick="runAiSandboxTest('How much does it cost to print 50 color posters?')" class="px-3 py-1.5 bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 rounded-xl text-xs font-semibold border border-slate-200 transition">💰 Pricing & Rates</button>
+                    <button onclick="runAiSandboxTest('I want to book an appointment for tomorrow at 3pm')" class="px-3 py-1.5 bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 rounded-xl text-xs font-semibold border border-slate-200 transition">📅 Booking Request</button>
+                    <button onclick="runAiSandboxTest('Can I talk to a human customer representative?')" class="px-3 py-1.5 bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 rounded-xl text-xs font-semibold border border-slate-200 transition">👤 Human Handover</button>
+                    <button onclick="runAiSandboxTest('Where is my order? Order ID is #48291')" class="px-3 py-1.5 bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 rounded-xl text-xs font-semibold border border-slate-200 transition">📦 Order Tracking</button>
+                </div>
+            </div>
+
+            <!-- Sandbox Interactive Form -->
+            <div class="space-y-3 pt-2">
+                <label class="block text-xs font-bold text-slate-700">Customer Prompt:</label>
+                <div class="flex space-x-2">
+                    <input type="text" id="sandbox-prompt" value="Hi! What are your printing charges and how can I place an order?" class="flex-1 bg-slate-50 text-slate-900 px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 font-medium text-sm"/>
+                    <button onclick="runAiSandboxTest(document.getElementById('sandbox-prompt').value)" id="sandbox-btn" class="px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl flex items-center space-x-2 shadow-sm">
+                        <i class="fas fa-play text-xs"></i>
+                        <span>Test AI Reply</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Output Box -->
+            <div class="bg-slate-50 rounded-2xl border border-slate-200 p-5 space-y-3 flex-1">
+                <div class="flex items-center justify-between">
+                    <span class="text-xs font-extrabold text-slate-700 uppercase tracking-wider flex items-center space-x-1.5">
+                        <i class="fas fa-robot text-emerald-600"></i>
+                        <span>AI Bot Response Output</span>
+                    </span>
+                    <span id="sandbox-meta" class="text-xs text-slate-500 font-mono font-bold bg-white px-2.5 py-1 rounded-lg border border-slate-200">Engine: Ready</span>
+                </div>
+                <div id="sandbox-output" class="bg-white p-4 rounded-xl border border-slate-200 text-sm text-slate-800 whitespace-pre-wrap leading-relaxed min-h-[160px] font-sans">
+                    Click "Test AI Reply" or one of the sample inquiries above to see the bot response.
+                </div>
+            </div>
+        </div>
+
+        <!-- ================= TAB 3: MESSAGE TEMPLATES VIEW ================= -->
         <div id="view-templates" class="hidden bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col space-y-4 min-h-[600px]">
             <div class="flex items-center justify-between pb-4 border-b border-slate-200">
                 <div>
@@ -751,7 +896,7 @@ async def serve_dashboard():
                         <i class="fas fa-layer-group text-blue-600"></i>
                         <span>Customer Support Message Templates</span>
                     </h2>
-                    <p class="text-xs text-slate-500 mt-0.5">Reusable response templates with dynamic variables: <code class="text-emerald-600 font-mono">{{name}}</code>, <code class="text-emerald-600 font-mono">{{phone}}</code>, <code class="text-emerald-600 font-mono">{{service}}</code>, <code class="text-emerald-600 font-mono">{{date_time}}</code></p>
+                    <p class="text-xs text-slate-500 mt-0.5">Reusable response templates with dynamic variables: <code class="text-emerald-600 font-mono">{{name}}</code>, <code class="text-emerald-600 font-mono">{{phone}}</code>, <code class="text-emerald-600 font-mono">{{service}}</code></p>
                 </div>
                 <button onclick="openCreateTemplateModal()" class="px-4 py-2 text-xs font-bold rounded-xl bg-blue-600 hover:bg-blue-700 text-white flex items-center space-x-1.5 shadow-sm transition">
                     <i class="fas fa-plus"></i>
@@ -765,7 +910,7 @@ async def serve_dashboard():
             </div>
         </div>
 
-        <!-- ================= TAB 3: BOOKINGS & APPOINTMENTS VIEW ================= -->
+        <!-- ================= TAB 4: BOOKINGS & APPOINTMENTS VIEW ================= -->
         <div id="view-bookings" class="hidden bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col space-y-4 min-h-[600px]">
             <div class="flex items-center justify-between pb-4 border-b border-slate-200">
                 <div>
@@ -802,7 +947,7 @@ async def serve_dashboard():
             </div>
         </div>
 
-        <!-- ================= TAB 4: WEBHOOK INSPECTOR VIEW ================= -->
+        <!-- ================= TAB 5: WEBHOOK INSPECTOR VIEW ================= -->
         <div id="view-webhooks" class="hidden bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col space-y-4 min-h-[600px]">
             <div class="flex items-center justify-between pb-4 border-b border-slate-200">
                 <div>
@@ -869,7 +1014,7 @@ async def serve_dashboard():
                     <button type="button" onclick="closeSimulateModal()" class="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold">Cancel</button>
                     <button type="submit" id="sim-submit-btn" class="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold flex items-center space-x-2 shadow-sm">
                         <i class="fas fa-paper-plane"></i>
-                        <span>Send Message</span>
+                        <span>Send & Reply</span>
                     </button>
                 </div>
             </form>
@@ -964,7 +1109,7 @@ async def serve_dashboard():
                 <div>
                     <label class="block text-slate-700 font-bold mb-1">AI Model Selection</label>
                     <select id="set-groq-model" class="w-full bg-slate-50 text-slate-900 px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 font-mono text-xs">
-                        <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (Fast & Reliable)</option>
+                        <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (Fast & Recommended)</option>
                         <option value="llama-3.1-8b-instant">llama-3.1-8b-instant (Ultra Fast)</option>
                         <option value="deepseek-r1-distill-llama-70b">deepseek-r1-distill-llama-70b (Deep Reasoning)</option>
                         <option value="mixtral-8x7b-32768">mixtral-8x7b-32768</option>
@@ -1058,7 +1203,7 @@ async def serve_dashboard():
 
         function switchTab(tab) {
             activeTab = tab;
-            ['chats', 'templates', 'bookings', 'webhooks'].forEach(t => {
+            ['chats', 'testai', 'templates', 'bookings', 'webhooks'].forEach(t => {
                 const view = document.getElementById('view-' + t);
                 const btn = document.getElementById('tab-btn-' + t);
                 if (t === tab) {
@@ -1090,7 +1235,6 @@ async def serve_dashboard():
                     document.getElementById('stat-contacts').innerText = stats.total_contacts || 0;
                     document.getElementById('stat-bookings').innerText = stats.total_bookings || 0;
                     document.getElementById('nav-bookings-count').innerText = stats.total_bookings || 0;
-                    document.getElementById('stat-latency').innerText = `${stats.avg_latency_ms || 0} ms`;
                     document.getElementById('stat-engine-badge').innerText = stats.groq_configured ? stats.groq_model : 'Customer Support AI';
                 }
 
@@ -1209,15 +1353,18 @@ async def serve_dashboard():
             container.innerHTML = messages.map(m => {
                 const isOutbound = m.direction === 'outbound';
                 const alignment = isOutbound ? 'justify-end' : 'justify-start';
-                // WhatsApp Light theme bubble colors
                 const bubbleBg = isOutbound ? 'bg-[#d9fdd3] text-slate-900 border border-emerald-200/50 rounded-tr-sm' : 'bg-white text-slate-900 border border-slate-200/80 rounded-tl-sm';
-                const senderLabel = isOutbound ? 'Support Agent' : escapeHtml(m.sender_name || 'Customer');
+                const senderLabel = isOutbound ? (m.sender_name || 'Support Agent') : escapeHtml(m.sender_name || 'Customer');
                 const engineTag = m.ai_model ? `<span class="text-[9px] px-1.5 py-0.2 bg-emerald-100 text-emerald-800 rounded font-bold mr-1"><i class="fas fa-robot mr-1"></i>${escapeHtml(m.ai_model)}</span>` : '';
+                const triggerBtn = !isOutbound ? `<button onclick="triggerAiReplyForPrompt('${escapeHtml(m.message)}')" title="Generate AI Reply to this" class="ml-2 text-[10px] text-emerald-600 hover:text-emerald-800 font-bold underline"><i class="fas fa-wand-magic-sparkles mr-0.5"></i>AI Reply</button>` : '';
 
                 return `
                     <div class="flex ${alignment}">
                         <div class="${bubbleBg} text-xs px-3.5 py-2.5 rounded-2xl max-w-[85%] md:max-w-[75%] shadow-sm break-words space-y-1">
-                            <div class="text-[11px] font-extrabold ${isOutbound ? 'text-emerald-700' : 'text-slate-700'}">${senderLabel}</div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-[11px] font-extrabold ${isOutbound ? 'text-emerald-700' : 'text-slate-700'}">${senderLabel}</span>
+                                ${triggerBtn}
+                            </div>
                             <div class="whitespace-pre-wrap leading-relaxed text-[13px]">${escapeHtml(m.message)}</div>
                             <div class="flex items-center justify-end space-x-1.5 pt-0.5 text-[10px] text-slate-500">
                                 ${engineTag}
@@ -1232,6 +1379,29 @@ async def serve_dashboard():
             if (shouldScroll) container.scrollTop = container.scrollHeight;
         }
 
+        async function triggerAiReplyForCurrent() {
+            if (!currentPhone) {
+                alert("Please select a conversation first.");
+                return;
+            }
+            await fetch('/api/dashboard/trigger-ai-reply', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: currentPhone })
+            });
+            fetchData(true);
+        }
+
+        async function triggerAiReplyForPrompt(prompt) {
+            if (!currentPhone) return;
+            await fetch('/api/dashboard/trigger-ai-reply', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: currentPhone, prompt: prompt })
+            });
+            fetchData(true);
+        }
+
         async function toggleContactBot(enabled) {
             if (!currentPhone) return;
             await fetch('/api/dashboard/contact/bot-toggle', {
@@ -1244,7 +1414,7 @@ async def serve_dashboard():
         async function sendReply(e) {
             e.preventDefault();
             if (!currentPhone) {
-                alert("Please select a conversation first.");
+                alert("Please select a conversation or simulate a message first.");
                 return;
             }
 
@@ -1252,7 +1422,7 @@ async def serve_dashboard():
             const msg = input.value.trim();
             if (!msg) return;
 
-            const mode = document.querySelector('input[name="reply_mode"]:checked').value;
+            const role = document.querySelector('input[name="reply_role"]:checked').value;
             const sendViaMeta = document.getElementById('send-meta-cloud').checked;
             const btn = document.getElementById('send-reply-btn');
 
@@ -1265,8 +1435,9 @@ async def serve_dashboard():
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         phone: currentPhone,
+                        name: currentContactName,
                         message: msg,
-                        type: mode,
+                        role: role,
                         send_via_meta: sendViaMeta
                     })
                 });
@@ -1284,6 +1455,38 @@ async def serve_dashboard():
                 input.disabled = false;
                 btn.disabled = false;
                 input.focus();
+            }
+        }
+
+        // AI Sandbox Testing
+        async function runAiSandboxTest(promptText) {
+            if (!promptText) return;
+            document.getElementById('sandbox-prompt').value = promptText;
+            const output = document.getElementById('sandbox-output');
+            const meta = document.getElementById('sandbox-meta');
+            const btn = document.getElementById('sandbox-btn');
+
+            btn.disabled = true;
+            output.innerHTML = `<span class="text-slate-400 italic"><i class="fas fa-spinner fa-spin mr-1"></i> Generating AI Bot reply...</span>`;
+            meta.innerText = "Engine: Generating...";
+
+            try {
+                const res = await fetch('/api/dashboard/test-ai', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt: promptText })
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    output.innerText = data.reply;
+                    meta.innerHTML = `<span class="text-emerald-600 font-bold">${data.engine}</span> • <span class="text-slate-500">${data.latency_ms} ms</span>`;
+                } else {
+                    output.innerText = "Error generating AI response.";
+                }
+            } catch (err) {
+                output.innerText = "Network Error: " + err.message;
+            } finally {
+                btn.disabled = false;
             }
         }
 
@@ -1357,6 +1560,7 @@ async def serve_dashboard():
                 .replace(/\{\{date_time\}\}/g, 'Tomorrow at 2:00 PM')
                 .replace(/\{\{service\}\}/g, 'Printing & Task Service');
             
+            document.getElementById('role-agent').checked = true;
             document.getElementById('reply-input').value = replaced;
             document.getElementById('reply-input').focus();
         }
@@ -1537,7 +1741,7 @@ async def serve_dashboard():
                 alert("Simulation error: " + err.message);
             } finally {
                 btn.disabled = false;
-                btn.innerHTML = `<i class="fas fa-paper-plane"></i> <span>Send Message</span>`;
+                btn.innerHTML = `<i class="fas fa-paper-plane"></i> <span>Send & Reply</span>`;
             }
         }
 
